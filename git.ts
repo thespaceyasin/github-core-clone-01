@@ -126,6 +126,35 @@ function v2Advertisement(): Buffer {
   ]);
 }
 
+/** The v2 capability advertisement never changes; build it once, not per clone. */
+const V2_ADVERTISEMENT = v2Advertisement();
+
+/**
+ * Per-repository caches for the two repeated upload-pack answers. A fetch pack
+ * depends only on the request (wants, haves, depth, shallow boundaries) and the
+ * content-addressed object graph — objects are immutable and only ever appended —
+ * so the same request always yields the same pack bytes. An ls-refs answer
+ * additionally depends on the current refs, so its key carries a refs fingerprint.
+ * Entries are capped; the map is cleared wholesale past the cap.
+ */
+const fetchCache = new WeakMap<Repo, Map<string, Buffer>>();
+const lsRefsCache = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_CAP = 64;
+
+function cacheGet(cache: WeakMap<Repo, Map<string, Buffer>>, repo: Repo, key: string): Buffer | undefined {
+  return cache.get(repo)?.get(key);
+}
+
+function cachePut(cache: WeakMap<Repo, Map<string, Buffer>>, repo: Repo, key: string, value: Buffer): void {
+  let map = cache.get(repo);
+  if (!map) {
+    map = new Map();
+    cache.set(repo, map);
+  }
+  if (map.size >= FETCH_CACHE_CAP) map.clear();
+  map.set(key, value);
+}
+
 /** Split a packfile into sideband-64k data packets (band 1), each carrying at most 65515 bytes. */
 function sidebandPack(pack: Buffer): Buffer[] {
   const packets: Buffer[] = [];
@@ -340,7 +369,14 @@ function handleUploadPack(repo: Repo, body: Buffer, protocolVersion: string | un
       return jsonError(400, `want ${want} is not known`);
     }
   }
-  const response = isV2 ? v2FetchResponse(repo, request) : v0FetchResponse(repo, request);
+  const response = (() => {
+    const cacheKey = `${isV2 ? '2' : '0'}|${request.wants.join(',')}|${request.haves.join(',')}|${request.depth ?? ''}|${request.shallowBoundaries.join(',')}`;
+    const cached = cacheGet(fetchCache, repo, cacheKey);
+    if (cached) return cached;
+    const built = isV2 ? v2FetchResponse(repo, request) : v0FetchResponse(repo, request);
+    cachePut(fetchCache, repo, cacheKey, built);
+    return built;
+  })();
   return {
     status: 200,
     headers: { 'Content-Type': 'application/x-git-upload-pack-result' },
@@ -376,6 +412,21 @@ function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
     return jsonError(400, err instanceof Error ? err.message : 'Malformed pkt-line stream');
   }
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+  // The answer depends on the refs and the requested options; identical clones
+  // repeat the same ls-refs, so cache it under a fingerprint of both.
+  const refsKey = [...repo.refs.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([name, oid]) => `${name}=${oid}`)
+    .join(';');
+  const cacheKey = `${refsKey}|${peel}|${symrefs}|${unborn}|${prefixes.join(',')}`;
+  const cached = cacheGet(lsRefsCache, repo, cacheKey);
+  if (cached) {
+    return {
+      status: 200,
+      headers: { 'Content-Type': 'application/x-git-upload-pack-result' },
+      body: cached,
+    };
+  }
   const parts: Buffer[] = [];
   const defaultTip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
   if (defaultTip && keep('HEAD')) {
@@ -397,10 +448,12 @@ function handleLsRefs(repo: Repo, body: Buffer): GitResponse {
     parts.push(pktLine(`${oid} ${name}${extra}\n`));
   }
   parts.push(Buffer.from('0000', 'ascii'));
+  const responseBody = Buffer.concat(parts);
+  cachePut(lsRefsCache, repo, cacheKey, responseBody);
   return {
     status: 200,
     headers: { 'Content-Type': 'application/x-git-upload-pack-result' },
-    body: Buffer.concat(parts),
+    body: responseBody,
   };
 }
 
@@ -567,7 +620,7 @@ export function handleGit(request: GitRequest, store: Store): GitResponse | null
     if (!repo) return jsonError(404, 'Not Found');
     const protocol = typeof headers['git-protocol'] === 'string' ? headers['git-protocol'] : undefined;
     if (service === 'git-upload-pack' && protocol === 'version=2') {
-      return { status: 200, headers: { 'Content-Type': 'application/x-git-upload-pack-advertisement' }, body: v2Advertisement() };
+      return { status: 200, headers: { 'Content-Type': 'application/x-git-upload-pack-advertisement' }, body: V2_ADVERTISEMENT };
     }
     const caps = service === 'git-upload-pack' ? UPLOAD_PACK_CAPS : RECEIVE_PACK_CAPS;
     return {

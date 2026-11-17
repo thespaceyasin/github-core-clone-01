@@ -765,14 +765,69 @@ export function readPack(pack: Buffer, external?: ReadonlyMap<string, GitObject>
 }
 
 /**
+ * Adler-32 checksum — the trailer of a zlib stream. The last four bytes of a zlib
+ * stream are the big-endian Adler-32 of the data it holds, which lets us locate a
+ * stream's end without probing. The modulo is deferred per 5552-byte chunk (zlib's
+ * NMAX); the running sums stay exactly representable as JS numbers and are reduced
+ * at each chunk boundary, so the final shift is safe.
+ */
+function adler32(data: Uint8Array): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 5552) {
+    const end = Math.min(data.length, i + 5552);
+    for (let j = i; j < end; j += 1) {
+      a += data[j];
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
  * Length in bytes of the zlib stream starting at `offset` (streams are self-terminating).
- * inflateSync throws on a truncated stream and ignores trailing bytes, so "inflates
- * without error" is monotone in the end position: false below the stream's end, true at
- * and past it. The first guess is the entry's raw size plus slack — a deflate stream is
- * rarely longer than the data it holds — then the window doubles until it works, and a
- * bisection inside the window finds the exact end.
+ *
+ * Fast path: inflate the generous first guess once (inflateSync ignores trailing
+ * bytes), then find the stream's end by its Adler-32 trailer. A candidate end is
+ * accepted only after re-inflating exactly to it reproduces the same bytes, so a
+ * coincidental four-byte match inside the deflate data cannot slip through. Falls
+ * back to the probing bisection below when the fast path cannot pin the end down
+ * (stream longer than the first guess, or no matching trailer found).
  */
 function zlibStreamLength(buffer: Buffer, offset: number, limit: number, hintSize: number): number {
+  const high = Math.min(limit, offset + Math.max(32, hintSize + 16));
+  try {
+    const data = zlibInflate(buffer.subarray(offset, high));
+    const trailer = Buffer.allocUnsafe(4);
+    trailer.writeUInt32BE(adler32(data), 0);
+    let at = buffer.indexOf(trailer, offset + 2);
+    while (at !== -1 && at + 4 <= high) {
+      const end = at + 4;
+      try {
+        if (zlibInflate(buffer.subarray(offset, end)).equals(data)) return end - offset;
+      } catch {
+        // Coincidental match inside the deflate data; keep looking.
+      }
+      at = buffer.indexOf(trailer, at + 1);
+    }
+  } catch {
+    // First guess too short (or stream malformed); fall through to the bisection.
+  }
+  return zlibStreamLengthBisect(buffer, offset, limit, hintSize);
+}
+
+/**
+ * Probing bisection fallback for zlibStreamLength: inflateSync throws on a truncated
+ * stream and ignores trailing bytes, so "inflates without error" is monotone in the
+ * end position: false below the stream's end, true at and past it. The first guess
+ * is the entry's raw size plus slack — a deflate stream is rarely longer than the
+ * data it holds — then the window doubles until it works, and a bisection inside
+ * the window finds the exact end.
+ */
+function zlibStreamLengthBisect(buffer: Buffer, offset: number, limit: number, hintSize: number): number {
   const works = (end: number): boolean => {
     try {
       zlibInflate(buffer.subarray(offset, end));

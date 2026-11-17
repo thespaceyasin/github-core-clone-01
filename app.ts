@@ -99,10 +99,14 @@ export function createApp(): Server {
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
-  const pathname = url.pathname;
+  // Parse the request target by hand: `new URL` is measurably slower and the
+  // handlers only need the path segments and the raw query string. Percent-decoding
+  // runs only on segments that actually contain a '%'.
+  const rawTarget = req.url ?? '/';
+  const queryAt = rawTarget.indexOf('?');
+  const pathname = queryAt === -1 ? rawTarget : rawTarget.slice(0, queryAt);
+  const query = queryAt === -1 ? new URLSearchParams() : new URLSearchParams(rawTarget.slice(queryAt + 1));
   const method = req.method ?? 'GET';
-  const baseUrl = `http://${req.headers.host ?? '127.0.0.1'}`;
 
   // Health: the only unauthenticated route.
   if (pathname === '/healthz') {
@@ -120,6 +124,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
 
   const segments = pathname.split('/').filter((part) => part !== '').map((part) => {
+    if (!part.includes('%')) return part;
     try {
       return decodeURIComponent(part);
     } catch {
@@ -166,9 +171,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   // Git smart HTTP: /{owner}/{repo}.git/...
   if (segments.length >= 2 && segments[1]!.endsWith('.git')) {
     const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
-    const headers: Record<string, string | string[] | undefined> = {};
-    for (const [key, value] of Object.entries(req.headers)) headers[key] = value;
-    const answer = handleGit({ method, segments, query: url.searchParams, body, headers }, store);
+    const answer = handleGit({ method, segments, query, body, headers: req.headers }, store);
     if (answer === null) {
       sendJson(res, 404, { message: 'Not Found' });
       return;
@@ -195,7 +198,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         }
       }
     }
-    const answer = handleRest({ method, segments, query: url.searchParams, body: parsed, baseUrl }, store);
+    const answer = handleRest(
+      { method, segments, query, body: parsed, baseUrl: `http://${req.headers.host ?? '127.0.0.1'}` },
+      store,
+    );
     if (answer.status === 204) {
       res.writeHead(204, { 'X-GitHub-Request-Id': nextRequestId() });
       res.end();
