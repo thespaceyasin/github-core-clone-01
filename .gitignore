@@ -1,0 +1,5 @@
+# Dependencies are never installed for this entry (standard library only), but if a
+# local install ever happens its output stays out of the repository.
+node_modules/
+# Local environment files (tokens, env URLs) must never be committed.
+.env
